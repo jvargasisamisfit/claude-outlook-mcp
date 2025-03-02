@@ -48,6 +48,10 @@ const OUTLOOK_MAIL_TOOL: Tool = {
         type: "string",
         description: "Email body content (required for send operation)"
       },
+      isHtml: {
+        type: "boolean",
+        description: "Whether the body content is HTML (optional for send operation, default: false)"
+      },
       cc: {
         type: "string",
         description: "CC email address (optional for send operation)"
@@ -55,6 +59,13 @@ const OUTLOOK_MAIL_TOOL: Tool = {
       bcc: {
         type: "string",
         description: "BCC email address (optional for send operation)"
+      },
+      attachments: {
+        type: "array",
+        description: "File paths to attach to the email (optional for send operation)",
+        items: {
+          type: "string"
+        }
       }
     },
     required: ["operation"]
@@ -411,111 +422,316 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   }
 }
 
-// Function to send an email
-async function sendEmail(to: string, subject: string, body: string, cc?: string, bcc?: string): Promise<string> {
-    console.error(`[sendEmail] Sending email to: ${to}, subject: "${subject}"`);
-    await checkOutlookAccess();
-  
-    // Extract name from email if possible (for display name)
-    const extractNameFromEmail = (email: string): string => {
-      // Try to extract a name from the email address (before the @)
-      const namePart = email.split('@')[0];
-      // Capitalize first letter of each word
-      return namePart
-        .split('.')
-        .map(part => part.charAt(0).toUpperCase() + part.slice(1))
-        .join(' ');
-    };
-  
-    // Get name for display
-    const toName = extractNameFromEmail(to);
-    const ccName = cc ? extractNameFromEmail(cc) : "";
-    const bccName = bcc ? extractNameFromEmail(bcc) : "";
-  
-    // Escape special characters
-    const escapedSubject = subject.replace(/"/g, '\\"');
-    const escapedBody = body.replace(/"/g, '\\"');
+async function checkAttachmentPath(filePath: string): Promise<string> {
+  try {
+    // Convert to absolute path if relative
+    let fullPath = filePath;
+    if (!filePath.startsWith('/')) {
+      const cwd = process.cwd();
+      fullPath = `${cwd}/${filePath}`;
+    }
     
-    // Try approach 1: Using specific syntax for directly adding address to msg
+    // Check if the file exists and is readable
+    const fs = require('fs');
+    const { promisify } = require('util');
+    const access = promisify(fs.access);
+    const stat = promisify(fs.stat);
+    
     try {
-      const script1 = `
-        tell application "Microsoft Outlook"
-          set msg to make new outgoing message with properties {subject:"${escapedSubject}", content:"${escapedBody}"}
+      await access(fullPath, fs.constants.R_OK);
+      const stats = await stat(fullPath);
+      
+      return `File exists and is readable: ${fullPath}\nSize: ${stats.size} bytes\nPermissions: ${stats.mode.toString(8)}\nLast modified: ${stats.mtime}`;
+    } catch (err) {
+      return `ERROR: Cannot access file: ${fullPath}\nError details: ${err.message}`;
+    }
+  } catch (error) {
+    return `Failed to check attachment path: ${error.message}`;
+  }
+}
+
+// Add a debug version of sending email with attachment to test if files are accessible
+async function debugSendEmailWithAttachment(
+  to: string,
+  subject: string,
+  body: string,
+  attachmentPath: string
+): Promise<string> {
+  // First check if the file exists and is readable
+  const fileStatus = await checkAttachmentPath(attachmentPath);
+  console.error(`[debugSendEmail] Attachment status: ${fileStatus}`);
+  
+  // Create a simple AppleScript that just attempts to open the file
+  const script = `
+    set theFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
+    try
+      tell application "Finder"
+        set fileExists to exists file theFile
+        set fileInfo to info for file theFile
+        return "File exists: " & fileExists & ", size: " & (size of fileInfo)
+      end tell
+    on error errMsg
+      return "Error accessing file: " & errMsg
+    end try
+  `;
+  
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[debugSendEmail] AppleScript file check: ${result}`);
+    
+    // Now try to actually create a draft with the attachment
+    const emailScript = `
+      tell application "Microsoft Outlook"
+        try
+          set newMessage to make new outgoing message with properties {subject:"DEBUG: ${subject.replace(/"/g, '\\"')}", visible:true}
+          set content of newMessage to "${body.replace(/"/g, '\\"')}"
+          set to recipients of newMessage to {"${to}"}
+          
+          try
+            set attachmentFile to POSIX file "${attachmentPath.replace(/"/g, '\\"')}"
+            make new attachment at newMessage with properties {file:attachmentFile}
+            set attachResult to "Successfully attached file"
+          on error attachErrMsg
+            set attachResult to "Failed to attach file: " & attachErrMsg
+          end try
+          
+          return attachResult
+        on error errMsg
+          return "Error creating email: " & errMsg
+        end try
+      end tell
+    `;
+    
+    const attachResult = await runAppleScript(emailScript);
+    console.error(`[debugSendEmail] Attachment result: ${attachResult}`);
+    
+    return `File check: ${fileStatus}\n\nAttachment test: ${attachResult}`;
+  } catch (error) {
+    console.error("[debugSendEmail] Error during debug:", error);
+    return `Debugging error: ${error.message}\n\nFile check: ${fileStatus}`;
+  }
+}
+// Update the sendEmail function to handle attachments and HTML content
+async function sendEmail(
+  to: string, 
+  subject: string, 
+  body: string, 
+  cc?: string, 
+  bcc?: string, 
+  isHtml: boolean = false,
+  attachments?: string[]
+): Promise<string> {
+  console.error(`[sendEmail] Sending email to: ${to}, subject: "${subject}"`);
+  console.error(`[sendEmail] Attachments: ${attachments ? JSON.stringify(attachments) : 'none'}`);
+  
+  await checkOutlookAccess();
+
+  // Extract name from email if possible (for display name)
+  const extractNameFromEmail = (email: string): string => {
+    const namePart = email.split('@')[0];
+    return namePart
+      .split('.')
+      .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+  };
+
+  // Get name for display
+  const toName = extractNameFromEmail(to);
+  const ccName = cc ? extractNameFromEmail(cc) : "";
+  const bccName = bcc ? extractNameFromEmail(bcc) : "";
+
+  // Escape special characters
+  const escapedSubject = subject.replace(/"/g, '\\"');
+  const escapedBody = body.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  
+  // Process attachments: Convert to absolute paths if they are relative
+  let processedAttachments: string[] = [];
+  if (attachments && attachments.length > 0) {
+    processedAttachments = attachments.map(path => {
+      // Check if path is absolute (starts with /)
+      if (path.startsWith('/')) {
+        return path;
+      }
+      // Get current working directory and join with relative path
+      const cwd = process.cwd();
+      return `${cwd}/${path}`;
+    });
+    console.error(`[sendEmail] Processed attachments: ${JSON.stringify(processedAttachments)}`);
+  }
+  
+  // Create attachment script part with better error handling
+  const attachmentScript = processedAttachments.length > 0 
+    ? processedAttachments.map(filePath => {
+      const escapedPath = filePath.replace(/"/g, '\\"');
+      return `
+        try
+          set attachmentFile to POSIX file "${escapedPath}"
+          make new attachment at msg with properties {file:attachmentFile}
+          log "Successfully attached file: ${escapedPath}"
+        on error errMsg
+          log "Failed to attach file: ${escapedPath} - Error: " & errMsg
+        end try
+      `;
+    }).join('\n')
+    : '';
+
+  // Try approach 1: Using specific syntax for creating a message with attachments
+  try {
+    const script1 = `
+      tell application "Microsoft Outlook"
+        try
+          set msg to make new outgoing message with properties {subject:"${escapedSubject}"}
+          
+          ${isHtml ? 
+            `set content type of msg to HTML
+             set content of msg to "${escapedBody}"` 
+          : 
+            `set content of msg to "${escapedBody}"`
+          }
+          
           tell msg
             set recipTo to make new to recipient with properties {email address:{name:"${toName}", address:"${to}"}}
             ${cc ? `set recipCc to make new cc recipient with properties {email address:{name:"${ccName}", address:"${cc}"}}` : ''}
             ${bcc ? `set recipBcc to make new bcc recipient with properties {email address:{name:"${bccName}", address:"${bcc}"}}` : ''}
+            
+            ${attachmentScript}
           end tell
+          
+          -- Delay to allow attachments to be processed
+          delay 1
+          
           send msg
-          return "Email sent successfully (method 1)"
+          return "Email sent successfully with attachments"
+        on error errMsg
+          return "Error: " & errMsg
+        end try
+      end tell
+    `;
+    
+    console.error("[sendEmail] Executing AppleScript method 1");
+    const result = await runAppleScript(script1);
+    console.error(`[sendEmail] Result (method 1): ${result}`);
+    
+    if (result.startsWith("Error:")) {
+      throw new Error(result);
+    }
+    
+    return result;
+  } catch (error1) {
+    console.error("[sendEmail] Method 1 failed:", error1);
+    
+    // Try approach 2: Using AppleScript's draft window method
+    try {
+      const script2 = `
+        tell application "Microsoft Outlook"
+          try
+            set newDraft to make new draft window
+            set theMessage to item 1 of mail items of newDraft
+            set subject of theMessage to "${escapedSubject}"
+            
+            ${isHtml ? 
+              `set content type of theMessage to HTML
+               set content of theMessage to "${escapedBody}"` 
+            : 
+              `set content of theMessage to "${escapedBody}"`
+            }
+            
+            set to recipients of theMessage to {"${to}"}
+            ${cc ? `set cc recipients of theMessage to {"${cc}"}` : ''}
+            ${bcc ? `set bcc recipients of theMessage to {"${bcc}"}` : ''}
+            
+            ${processedAttachments.map(filePath => {
+              const escapedPath = filePath.replace(/"/g, '\\"');
+              return `
+                try
+                  set attachmentFile to POSIX file "${escapedPath}"
+                  make new attachment at theMessage with properties {file:attachmentFile}
+                  log "Successfully attached file: ${escapedPath}"
+                on error attachErrMsg
+                  log "Failed to attach file: ${escapedPath} - Error: " & attachErrMsg
+                end try
+              `;
+            }).join('\n')}
+            
+            -- Delay to allow attachments to be processed
+            delay 1
+            
+            send theMessage
+            return "Email sent successfully with method 2"
+          on error errMsg
+            return "Error: " & errMsg
+          end try
         end tell
       `;
       
-      const result = await runAppleScript(script1);
-      console.error(`[sendEmail] Result (method 1): ${result}`);
-      return result;
-    } catch (error1) {
-      console.error("[sendEmail] Method 1 failed:", error1);
+      console.error("[sendEmail] Executing AppleScript method 2");
+      const result = await runAppleScript(script2);
+      console.error(`[sendEmail] Result (method 2): ${result}`);
       
-      // Try approach 2: Using Application Events to automate UI interaction
+      if (result.startsWith("Error:")) {
+        throw new Error(result);
+      }
+      
+      return result;
+    } catch (error2) {
+      console.error("[sendEmail] Method 2 failed:", error2);
+      
+      // Try approach 3: Create a draft for the user to manually send
       try {
-        const script2 = `
+        const script3 = `
           tell application "Microsoft Outlook"
-            activate
-            set newMessage to make new outgoing message
-            set subject of newMessage to "${escapedSubject}"
-            set content of newMessage to "${escapedBody}"
-            open newMessage
-            delay 1
+            try
+              set newMessage to make new outgoing message with properties {subject:"${escapedSubject}", visible:true}
+              
+              ${isHtml ? 
+                `set content type of newMessage to HTML
+                 set content of newMessage to "${escapedBody}"` 
+              : 
+                `set content of newMessage to "${escapedBody}"`
+              }
+              
+              set to recipients of newMessage to {"${to}"}
+              ${cc ? `set cc recipients of newMessage to {"${cc}"}` : ''}
+              ${bcc ? `set bcc recipients of newMessage to {"${bcc}"}` : ''}
+              
+              ${processedAttachments.map(filePath => {
+                const escapedPath = filePath.replace(/"/g, '\\"');
+                return `
+                  try
+                    set attachmentFile to POSIX file "${escapedPath}"
+                    make new attachment at newMessage with properties {file:attachmentFile}
+                    log "Successfully attached file: ${escapedPath}"
+                  on error attachErrMsg
+                    log "Failed to attach file: ${escapedPath} - Error: " & attachErrMsg
+                  end try
+                `;
+              }).join('\n')}
+              
+              -- Display the message
+              activate
+              return "Email draft created with attachments. Please review and send manually."
+            on error errMsg
+              return "Error: " & errMsg
+            end try
           end tell
-          
-          tell application "System Events"
-            tell process "Microsoft Outlook"
-              -- Type recipient in To field
-              keystroke "${to}"
-              keystroke tab
-              ${cc ? `keystroke "${cc}"
-              keystroke tab` : ''}
-              ${bcc ? `keystroke "${bcc}"
-              keystroke tab` : ''}
-              -- Send the message
-              keystroke "s" using {command down}
-            end tell
-          end tell
-          
-          return "Email sent successfully (method 2 - UI automation)"
         `;
         
-        const result = await runAppleScript(script2);
-        console.error(`[sendEmail] Result (method 2): ${result}`);
-        return result;
-      } catch (error2) {
-        console.error("[sendEmail] Method 2 failed:", error2);
+        console.error("[sendEmail] Executing AppleScript method 3");
+        const result = await runAppleScript(script3);
+        console.error(`[sendEmail] Result (method 3): ${result}`);
         
-        // Try approach 3: Creating a simple temporary draft
-        try {
-          const script3 = `
-            tell application "Microsoft Outlook"
-              set newDraft to make new draft window
-              set theMessage to item 1 of mail items of newDraft
-              set subject of theMessage to "${escapedSubject}"
-              set content of theMessage to "${escapedBody}"
-              set visibleMessage to make new outgoing message with properties {subject:"${escapedSubject}", content:"${escapedBody}", visible:true}
-              display dialog "Please manually add recipient: ${to} and then send the message" buttons {"OK"} default button "OK"
-              return "Email draft created, please add recipient and send manually"
-            end tell
-          `;
-          
-          const result = await runAppleScript(script3);
-          console.error(`[sendEmail] Result (method 3): ${result}`);
-          return "A draft has been created in Outlook. Please add the recipient and send it manually.";
-        } catch (error3) {
-          console.error("[sendEmail] All methods failed:", error3);
-          throw new Error(`Could not send or create email. Please check if Outlook is properly configured with your email account and that you have granted necessary permissions to Terminal/iTerm. First try opening Outlook and sending a test email manually to verify your account configuration.`);
+        if (result.startsWith("Error:")) {
+          throw new Error(result);
         }
+        
+        return "A draft has been created in Outlook with the content and attachments. Please review and send it manually.";
+      } catch (error3) {
+        console.error("[sendEmail] All methods failed:", error3);
+        throw new Error(`Could not send or create email. Please check if Outlook is properly configured and that you have granted necessary permissions. Error details: ${error3}`);
       }
     }
   }
+}
 // Function to get mail folders - this works based on your logs
 async function getMailFolders(): Promise<string[]> {
     console.error("[getMailFolders] Getting mail folders");
@@ -1242,8 +1458,10 @@ function isMailArgs(args: unknown): args is {
   to?: string;
   subject?: string;
   body?: string;
+  isHtml?: boolean;
   cc?: string;
   bcc?: string;
+  attachments?: string[];
 } {
   if (typeof args !== "object" || args === null) return false;
   
@@ -1386,11 +1604,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             };
           }
           
+          // Update the handler in CallToolRequestSchema
           case "send": {
             if (!args.to || !args.subject || !args.body) {
               throw new Error("Recipient (to), subject, and body are required for send operation");
             }
-            const result = await sendEmail(args.to, args.subject, args.body, args.cc, args.bcc);
+            
+            // Validate attachments if provided
+            if (args.attachments && !Array.isArray(args.attachments)) {
+              throw new Error("Attachments must be an array of file paths");
+            }
+            
+            // Log attachment information for debugging
+            console.error(`[CallTool] Send email with attachments: ${args.attachments ? JSON.stringify(args.attachments) : 'none'}`);
+            
+            const result = await sendEmail(
+              args.to, 
+              args.subject, 
+              args.body, 
+              args.cc, 
+              args.bcc, 
+              args.isHtml || false,
+              args.attachments
+            );
+            
             return {
               content: [{ type: "text", text: result }],
               isError: false

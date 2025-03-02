@@ -8,6 +8,8 @@ This is a Model Context Protocol (MCP) tool that allows Claude to interact with 
   - Read unread and regular emails
   - Search emails by keywords
   - Send emails with to, cc, and bcc recipients
+  - **Send HTML-formatted emails**
+  - **Attach files to emails**
   - List mail folders
 - Calendar:
   - View today's events
@@ -70,37 +72,6 @@ Make sure to replace `YOURUSERNAME` with your actual macOS username and adjust t
    - Give Terminal (or your preferred terminal app) access to Accessibility features
    - You may see permission prompts when the tool is first used
 
-## Troubleshooting
-
-If you encounter the error `Cannot find module '@modelcontextprotocol/sdk/server/index.js'`:
-
-1. Make sure you've run `bun install` to install all dependencies
-2. Try installing the MCP SDK explicitly:
-   ```bash
-   bun add @modelcontextprotocol/sdk@^1.5.0
-   ```
-3. Check if the module exists in your node_modules directory:
-   ```bash
-   ls -la node_modules/@modelcontextprotocol/sdk/server/
-   ```
-
-If the error persists, try creating a new project with Bun:
-
-```bash
-mkdir -p ~/Desktop/others/claudeMCP/claude-outlook-mcp
-cd ~/Desktop/others/claudeMCP/claude-outlook-mcp
-bun init -y
-```
-
-Then copy the package.json and index.ts files to the new directory and run:
-
-```bash
-bun install
-bun run index.ts
-```
-
-Update your claude_desktop_config.json to point to the new location.
-
 ## Usage
 
 Once installed, you can use the Outlook tool directly from Claude by asking questions like:
@@ -122,6 +93,10 @@ Check my unread emails in Outlook
 
 ```
 Send an email to alex@example.com with subject "Project Update" and the following body: Here's the latest update on our project. We've completed phase 1 and are moving on to phase 2.
+```
+
+```
+Send an HTML email to team@example.com with subject "Weekly Report" and attach the quarterly_results.pdf file
 ```
 
 ```
@@ -151,6 +126,65 @@ List all my Outlook contacts
 ```
 Search for contact information for Jane Smith
 ```
+
+## Advanced Features
+
+### HTML Email Support
+
+You can send rich HTML-formatted emails by setting the `isHtml` parameter to true:
+
+```
+Send an HTML email to john@example.com with the subject "Project Update" and body "<h1>Project Update</h1><p>We've made <b>significant progress</b> on the project.</p>"
+```
+
+### File Attachments
+
+You can attach files to your emails by providing the file paths in the `attachments` parameter:
+
+```
+Send an email to jane@example.com with subject "Monthly Report" and attach the reports/march_2025.pdf file
+```
+
+For best results with attachments:
+- Use absolute file paths when possible
+- Make sure the files are accessible to the process running the MCP tool
+- Attachments will automatically be handled with robust error detection
+
+## Troubleshooting
+
+If you encounter issues with attachments:
+- Check if the file exists and is readable
+- Use absolute file paths instead of relative paths
+- Make sure the user running the process has permission to read the file
+
+If you encounter the error `Cannot find module '@modelcontextprotocol/sdk/server/index.js'`:
+
+1. Make sure you've run `bun install` to install all dependencies
+2. Try installing the MCP SDK explicitly:
+   ```bash
+   bun add @modelcontextprotocol/sdk@^1.5.0
+   ```
+3. Check if the module exists in your node_modules directory:
+   ```bash
+   ls -la node_modules/@modelcontextprotocol/sdk/server/
+   ```
+
+If the error persists, try creating a new project with Bun:
+
+```bash
+mkdir -p ~/yourpath/claude-outlook-mcp
+cd ~/yourpath/claude-outlook-mcp
+bun init -y
+```
+
+Then copy the package.json and index.ts files to the new directory and run:
+
+```bash
+bun install
+bun run index.ts
+```
+
+Update your claude_desktop_config.json to point to the new location.
 
 ## License
 
