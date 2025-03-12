@@ -2,6 +2,10 @@
 
 This is a Model Context Protocol (MCP) tool that allows Claude to interact with Microsoft Outlook for macOS.
 
+<a href="https://glama.ai/mcp/servers/0j71n92wnh">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/0j71n92wnh/badge" alt="Claude Outlook Tool MCP server" />
+</a>
+
 ## Features
 
 - Mail:
