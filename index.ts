@@ -81,8 +81,8 @@ const OUTLOOK_CALENDAR_TOOL: Tool = {
     properties: {
       operation: {
         type: "string",
-        description: "Operation to perform: 'today', 'upcoming', 'search', or 'create'",
-        enum: ["today", "upcoming", "search", "create"]
+        description: "Operation to perform: 'today', 'upcoming', 'search', 'create', 'delete', or 'update'",
+        enum: ["today", "upcoming", "search", "create", "delete", "update"]
       },
       searchTerm: {
         type: "string",
@@ -98,27 +98,31 @@ const OUTLOOK_CALENDAR_TOOL: Tool = {
       },
       subject: {
         type: "string",
-        description: "Event subject/title (required for create operation)"
+        description: "Event subject/title (required for create, optional for update)"
       },
       start: {
         type: "string",
-        description: "Start time in ISO format (required for create operation)"
+        description: "Start time in ISO format (required for create, optional for update)"
       },
       end: {
         type: "string",
-        description: "End time in ISO format (required for create operation)"
+        description: "End time in ISO format (required for create, optional for update)"
       },
       location: {
         type: "string",
-        description: "Event location (optional for create operation)"
+        description: "Event location (optional for create and update)"
       },
       body: {
         type: "string",
-        description: "Event description/body (optional for create operation)"
+        description: "Event description/body (optional for create and update)"
       },
       attendees: {
         type: "string",
         description: "Comma-separated list of attendee email addresses (optional for create operation)"
+      },
+      eventId: {
+        type: "string",
+        description: "Event ID (required for delete and update operations)"
       }
     },
     required: ["operation"]
@@ -328,11 +332,23 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
   console.error(`[searchEmails] Searching for "${searchTerm}" in folder: ${folder}, limit: ${limit}`);
   await checkOutlookAccess();
   
-  const folderPath = folder === "Inbox" ? "inbox" : folder;
   const script = `
     tell application "Microsoft Outlook"
       try
-        set theFolder to ${folderPath}
+        -- Get the folder directly or by name
+        ${folder.toLowerCase() === 'inbox' ?
+          'set theFolder to inbox' :
+          `set targetFolder to null
+        set allFolders to mail folders
+        repeat with mailFolder in allFolders
+          if name of mailFolder is "${folder}" then
+            set targetFolder to mailFolder
+            exit repeat
+          end if
+        end repeat
+        if targetFolder is null then set targetFolder to inbox
+        set theFolder to targetFolder`}
+
         set searchResults to {}
         set allMessages to messages of theFolder
         set i to 0
@@ -380,36 +396,39 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
       throw new Error(result);
     }
     
-    // Parse the emails similar to unread emails
-    const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+    // Parse the emails - AppleScript returns comma-separated format
+    const emails: any[] = [];
+
+    if (result && result.includes('subject:')) {
+      // Split by id to separate emails (id is always at the end before content)
+      const emailStrings = result.split(/(?<=id:\d+),\s*(?=subject:)/);
+
+      if (emailStrings.length === 1 && result.includes('id:')) {
+        emailStrings[0] = result;
+      }
+
+      for (const emailStr of emailStrings) {
+        if (!emailStr.trim()) continue;
+
         try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              email[key] = value;
-            }
-          });
-          
-          if (email.subject || email.sender) {
+          // Parse fields - content can have commas and HTML
+          const subjectMatch = emailStr.match(/subject:([^]*?)(?=,\s*sender:)/);
+          const senderMatch = emailStr.match(/sender:([^]*?)(?=,\s*date:)/);
+          const dateMatch = emailStr.match(/date:([^]*?)(?=,\s*id:)/);
+          const idMatch = emailStr.match(/id:(\d+)/);
+          const contentMatch = emailStr.match(/content:([^]*?)$/);
+
+          if (subjectMatch || senderMatch) {
             emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || ""
+              subject: subjectMatch ? subjectMatch[1].trim() : "No subject",
+              sender: senderMatch ? senderMatch[1].trim() : "Unknown sender",
+              dateSent: dateMatch ? dateMatch[1].trim() : new Date().toString(),
+              content: contentMatch ? contentMatch[1].trim().substring(0, 200) + "..." : "[Content not available]",
+              id: idMatch ? idMatch[1].trim() : ""
             });
           }
         } catch (parseError) {
-          console.error('[searchEmails] Error parsing email match:', parseError);
+          console.error('[searchEmails] Error parsing email:', parseError);
         }
       }
     }
@@ -761,16 +780,17 @@ async function getMailFolders(): Promise<string[]> {
   }
   
   // Function to read emails in a folder that uses simple AppleScript
-async function readEmails(folder: string = "Inbox", limit: number = 10): Promise<any[]> {
+async function readEmails(folder: string = "Inbox", limit: number = 10): Promise<Array<{subject: string, sender: string, dateSent: string, content: string, id: string}>> {
     console.error(`[readEmails] Reading emails from folder: ${folder}, limit: ${limit}`);
     await checkOutlookAccess();
-    
-    // Use a simplified approach that should be more compatible
+
     const script = `
       tell application "Microsoft Outlook"
         try
-          -- Get the folder by name safely
-          set targetFolder to null
+          -- Get the folder directly
+          ${folder.toLowerCase() === 'inbox' ?
+            'set targetFolder to inbox' :
+            `set targetFolder to null
           set allFolders to mail folders
           repeat with mailFolder in allFolders
             if name of mailFolder is "${folder}" then
@@ -778,58 +798,190 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
               exit repeat
             end if
           end repeat
-          
-          if targetFolder is null then set targetFolder to inbox
-          
-          -- Get messages
+
+          if targetFolder is null then set targetFolder to inbox`}
+
+          -- Get messages with proper record structure
           set messageList to {}
           set msgCount to 0
           set allMsgs to messages of targetFolder
-          
+
           repeat with i from 1 to (count of allMsgs)
             if msgCount >= ${limit} then exit repeat
-            
+
             try
               set theMsg to item i of allMsgs
-              set msgSubject to subject of theMsg
+
+              -- Get sender information
               set msgSender to sender of theMsg
-              set msgDate to time sent of theMsg
-              
-              -- Create a simple text representation for the message
-              set msgInfo to msgSubject & " | " & msgSender & " | " & msgDate
-              set end of messageList to msgInfo
+              set senderName to "Unknown"
+              set senderAddress to "unknown@example.com"
+
+              try
+                set senderName to name of msgSender
+                set senderAddress to address of msgSender
+              on error
+                try
+                  set senderAddress to msgSender as string
+                on error
+                  -- Keep defaults
+                end try
+              end try
+
+              -- Get message content (limited to first 500 chars)
+              set msgContent to ""
+              try
+                set msgContent to content of theMsg
+                if length of msgContent > 500 then
+                  set msgContent to (text 1 thru 500 of msgContent) & "..."
+                end if
+              on error
+                set msgContent to "[Content not available]"
+              end try
+
+              -- Create structured record
+              set msgData to {subject:subject of theMsg, ¬
+                         senderName:senderName, ¬
+                         senderAddress:senderAddress, ¬
+                         dateReceived:time sent of theMsg, ¬
+                         msgContent:msgContent, ¬
+                         msgId:id of theMsg}
+
+              set end of messageList to msgData
               set msgCount to msgCount + 1
             on error
               -- Skip problematic messages
             end try
           end repeat
-          
+
           return messageList
         on error errMsg
           return "Error: " & errMsg
         end try
       end tell
     `;
-    
+
     try {
       const result = await runAppleScript(script);
-      
+      console.error(`[readEmails] Raw result type: ${typeof result}, length: ${result ? result.length : 0}`);
+
+      if (!result) {
+        console.error("[readEmails] No result returned from AppleScript");
+        return [];
+      }
+
       if (result.startsWith("Error:")) {
         throw new Error(result);
       }
-      
-      // Parse the results in a simple format
-      const emails = result.split(", ").map(msgInfo => {
-        const parts = msgInfo.split(" | ");
-        return {
-          subject: parts[0] || "No subject",
-          sender: parts[1] || "Unknown sender",
-          dateSent: parts[2] || new Date().toString(),
-          content: "Content not retrieved in simple mode"
-        };
-      });
-      
-      console.error(`[readEmails] Found ${emails.length} emails using simplified approach`);
+
+      // Parse AppleScript records
+      const emails: Array<{subject: string, sender: string, dateSent: string, content: string, id: string}> = [];
+
+      console.error(`[readEmails] Parsing result of length ${result.length}`);
+
+      // AppleScript returns records in comma-separated format
+      // Split by msgId pattern to separate emails
+      if (result && result.includes('subject:')) {
+        // Split emails by looking for msgId:NUMBER followed by comma and subject:
+        let emailStrings = result.split(/(?<=msgId:\d+),\s*(?=subject:)/);
+
+        // If no split happened, treat the whole result as one email
+        if (emailStrings.length === 1) {
+          emailStrings = [result];
+        }
+
+        console.error(`[readEmails] Split into ${emailStrings.length} email strings`);
+
+        for (const emailStr of emailStrings) {
+          if (!emailStr.trim()) continue;
+
+          try {
+            // Parse each field more carefully
+            let subject = "No subject";
+            let senderName = "Unknown";
+            let senderAddress = "unknown@example.com";
+            let dateReceived = new Date().toString();
+            let msgContent = "[Content not available]";
+            let msgId = "";
+
+            // Extract subject (up to ", senderName:")
+            const subjectMatch = emailStr.match(/subject:([^]*?)(?=,\s*senderName:)/);
+            if (subjectMatch) subject = subjectMatch[1].trim();
+
+            // Extract sender name (up to ", senderAddress:")
+            const senderNameMatch = emailStr.match(/senderName:([^]*?)(?=,\s*senderAddress:)/);
+            if (senderNameMatch) senderName = senderNameMatch[1].trim();
+
+            // Extract sender address (up to ", dateReceived:")
+            const senderAddressMatch = emailStr.match(/senderAddress:([^]*?)(?=,\s*dateReceived:)/);
+            if (senderAddressMatch) senderAddress = senderAddressMatch[1].trim();
+
+            // Extract date (up to ", msgContent:")
+            const dateMatch = emailStr.match(/dateReceived:([^]*?)(?=,\s*msgContent:)/);
+            if (dateMatch) dateReceived = dateMatch[1].trim();
+
+            // Extract content (up to ", msgId:" or end)
+            const contentMatch = emailStr.match(/msgContent:([^]*?)(?=,\s*msgId:|$)/);
+            if (contentMatch) {
+              msgContent = contentMatch[1].trim();
+              // Truncate HTML content for display
+              if (msgContent.length > 200) {
+                msgContent = msgContent.substring(0, 200) + "...";
+              }
+            }
+
+            // Extract ID
+            const idMatch = emailStr.match(/msgId:(\d+)/);
+            if (idMatch) msgId = idMatch[1];
+
+            const email = {
+              subject: subject,
+              sender: `${senderName} <${senderAddress}>`,
+              dateSent: dateReceived,
+              content: msgContent,
+              id: msgId
+            };
+
+            emails.push(email);
+          } catch (parseError) {
+            console.error('[readEmails] Error parsing email:', parseError);
+          }
+        }
+      }
+
+      // If no emails were parsed with the above method, try curly brace format
+      if (emails.length === 0) {
+        const recordMatches = result.match(/\{[^}]+\}/g);
+
+        if (recordMatches && recordMatches.length > 0) {
+          for (const record of recordMatches) {
+            try {
+              const subjectMatch = record.match(/subject:([^,}]+)/);
+              const senderNameMatch = record.match(/senderName:([^,}]+)/);
+              const senderAddressMatch = record.match(/senderAddress:([^,}]+)/);
+              const dateMatch = record.match(/dateReceived:([^,}]+)/);
+              const contentMatch = record.match(/msgContent:([^,}]+)/);
+              const idMatch = record.match(/msgId:([^,}]+)/);
+
+              const email = {
+                subject: subjectMatch ? subjectMatch[1].trim() : "No subject",
+                sender: senderNameMatch && senderAddressMatch ?
+                  `${senderNameMatch[1].trim()} <${senderAddressMatch[1].trim()}>` :
+                  "Unknown sender",
+                dateSent: dateMatch ? dateMatch[1].trim() : new Date().toString(),
+                content: contentMatch ? contentMatch[1].trim() : "[Content not available]",
+                id: idMatch ? idMatch[1].trim() : ""
+              };
+
+              emails.push(email);
+            } catch (parseError) {
+              console.error('[readEmails] Error parsing email record:', parseError);
+            }
+          }
+        }
+      }
+
+      console.error(`[readEmails] Found ${emails.length} emails`);
       return emails;
     } catch (error) {
       console.error("[readEmails] Error reading emails:", error);
@@ -845,73 +997,104 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
 async function getTodayEvents(limit: number = 10): Promise<any[]> {
   console.error(`[getTodayEvents] Getting today's events, limit: ${limit}`);
   await checkOutlookAccess();
-  
+
   const script = `
     tell application "Microsoft Outlook"
       set todayEvents to {}
-      set theCalendar to default calendar
+
+      -- Use calendar id 119 (main Calendar) since default calendar doesn't work
+      -- after switching from New to Classic Outlook
+      try
+        set theCalendar to calendar id 119
+      on error
+        -- Fallback: try to find a calendar named "Calendar"
+        set allCalendars to calendars
+        repeat with cal in allCalendars
+          if name of cal is "Calendar" then
+            set theCalendar to cal
+            exit repeat
+          end if
+        end repeat
+      end try
+
       set todayDate to current date
       set startOfDay to todayDate - (time of todayDate)
       set endOfDay to startOfDay + 1 * days
-      
-      set eventList to events of theCalendar whose start time is greater than or equal to startOfDay and start time is less than endOfDay
-      
+
+      -- Get all events and filter manually since the where clause doesn't work
+      set allEvents to calendar events of theCalendar
+      set eventList to {}
+
+      repeat with evt in allEvents
+        try
+          if start time of evt >= startOfDay and start time of evt < endOfDay then
+            set end of eventList to evt
+          end if
+        on error
+          -- Skip events that can't be accessed
+        end try
+      end repeat
+
       set eventCount to count of eventList
       set limitCount to ${limit}
-      
+
       if eventCount < limitCount then
         set limitCount to eventCount
       end if
-      
+
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
         set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
+                     startTime:start time of theEvent, ¬
+                     endTime:end time of theEvent, ¬
                      location:location of theEvent, ¬
-                     id:id of theEvent}
-        
+                     eventId:id of theEvent}
+
         set end of todayEvents to eventData
       end repeat
-      
+
       return todayEvents
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getTodayEvents] Raw result length: ${result.length}`);
     
-    // Parse the results
-    const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+    // Parse the results - format is comma-separated like: subject:X, startTime:Y, endTime:Z, location:A, eventId:B
+    const events: Array<{subject: string, start: string, end: string, location: string, id: string}> = [];
+
+    if (result && result.includes('subject:')) {
+      // Split by eventId to separate individual events
+      const eventStrings = result.split(/(?<=eventId:\d+),\s*(?=subject:)/);
+
+      // If no split happened, treat whole result as one event
+      if (eventStrings.length === 1 && result.includes('eventId:')) {
+        eventStrings[0] = result;
+      }
+
+      for (const eventStr of eventStrings) {
+        if (!eventStr.trim()) continue;
+
         try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
-          });
-          
-          if (event.subject) {
+          // Parse each field - times can contain commas so we need to be careful
+          const subjectMatch = eventStr.match(/subject:([^]*?)(?=,\s*startTime:)/);
+          const startMatch = eventStr.match(/startTime:([^]*?)(?=,\s*endTime:)/);
+          const endMatch = eventStr.match(/endTime:([^]*?)(?=,\s*location:)/);
+          const locationMatch = eventStr.match(/location:([^]*?)(?=,\s*eventId:)/);
+          const idMatch = eventStr.match(/eventId:(\d+)/);
+
+          if (subjectMatch) {
             events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
+              subject: subjectMatch[1].trim(),
+              start: startMatch ? startMatch[1].trim() : "",
+              end: endMatch ? endMatch[1].trim() : "",
+              location: locationMatch ? locationMatch[1].trim() : "No location",
+              id: idMatch ? idMatch[1].trim() : ""
             });
           }
         } catch (parseError) {
-          console.error('[getTodayEvents] Error parsing event match:', parseError);
+          console.error('[getTodayEvents] Error parsing event:', parseError);
         }
       }
     }
@@ -932,69 +1115,97 @@ async function getUpcomingEvents(days: number = 7, limit: number = 10): Promise<
   const script = `
     tell application "Microsoft Outlook"
       set upcomingEvents to {}
-      set theCalendar to default calendar
+
+      -- Use calendar id 119 since default calendar doesn't work
+      try
+        set theCalendar to calendar id 119
+      on error
+        set allCalendars to calendars
+        repeat with cal in allCalendars
+          if name of cal is "Calendar" then
+            set theCalendar to cal
+            exit repeat
+          end if
+        end repeat
+      end try
+
       set todayDate to current date
       set startOfToday to todayDate - (time of todayDate)
       set endDate to startOfToday + ${days} * days
-      
-      set eventList to events of theCalendar whose start time is greater than or equal to todayDate and start time is less than endDate
-      
+
+      -- Get all events and filter manually
+      set allEvents to calendar events of theCalendar
+      set eventList to {}
+
+      repeat with evt in allEvents
+        try
+          if start time of evt >= todayDate and start time of evt < endDate then
+            set end of eventList to evt
+          end if
+        on error
+          -- Skip events that can't be accessed
+        end try
+      end repeat
+
       set eventCount to count of eventList
       set limitCount to ${limit}
-      
+
       if eventCount < limitCount then
         set limitCount to eventCount
       end if
-      
+
       repeat with i from 1 to limitCount
         set theEvent to item i of eventList
         set eventData to {subject:subject of theEvent, ¬
-                     start:start time of theEvent, ¬
-                     end:end time of theEvent, ¬
+                     startTime:start time of theEvent, ¬
+                     endTime:end time of theEvent, ¬
                      location:location of theEvent, ¬
-                     id:id of theEvent}
-        
+                     eventId:id of theEvent}
+
         set end of upcomingEvents to eventData
       end repeat
-      
+
       return upcomingEvents
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[getUpcomingEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
-    const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+
+    // Parse the results - format is comma-separated like getTodayEvents
+    const events: Array<{subject: string, start: string, end: string, location: string, id: string}> = [];
+
+    if (result && result.includes('subject:')) {
+      // Split by eventId to separate individual events
+      const eventStrings = result.split(/(?<=eventId:\d+),\s*(?=subject:)/);
+
+      if (eventStrings.length === 1 && result.includes('eventId:')) {
+        eventStrings[0] = result;
+      }
+
+      for (const eventStr of eventStrings) {
+        if (!eventStr.trim()) continue;
+
         try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
-          });
-          
-          if (event.subject) {
+          // Parse each field - times can contain commas
+          const subjectMatch = eventStr.match(/subject:([^]*?)(?=,\s*startTime:)/);
+          const startMatch = eventStr.match(/startTime:([^]*?)(?=,\s*endTime:)/);
+          const endMatch = eventStr.match(/endTime:([^]*?)(?=,\s*location:)/);
+          const locationMatch = eventStr.match(/location:([^]*?)(?=,\s*eventId:)/);
+          const idMatch = eventStr.match(/eventId:(\d+)/);
+
+          if (subjectMatch) {
             events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
+              subject: subjectMatch[1].trim(),
+              start: startMatch ? startMatch[1].trim() : "",
+              end: endMatch ? endMatch[1].trim() : "",
+              location: locationMatch ? locationMatch[1].trim() : "No location",
+              id: idMatch ? idMatch[1].trim() : ""
             });
           }
         } catch (parseError) {
-          console.error('[getUpcomingEvents] Error parsing event match:', parseError);
+          console.error('[getUpcomingEvents] Error parsing event:', parseError);
         }
       }
     }
@@ -1015,67 +1226,90 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
   const script = `
     tell application "Microsoft Outlook"
       set searchResults to {}
-      set theCalendar to default calendar
-      set allEvents to events of theCalendar
-      set i to 0
-      set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-      
-      repeat with theEvent in allEvents
-        if (subject of theEvent contains searchString) or (location of theEvent contains searchString) then
-          set i to i + 1
-          set eventData to {subject:subject of theEvent, ¬
-                       start:start time of theEvent, ¬
-                       end:end time of theEvent, ¬
-                       location:location of theEvent, ¬
-                       id:id of theEvent}
-          
-          set end of searchResults to eventData
-          
-          -- Stop if we've reached the limit
-          if i >= ${limit} then
+
+      -- Use calendar id 119 since default calendar doesn't work
+      try
+        set theCalendar to calendar id 119
+      on error
+        set allCalendars to calendars
+        repeat with cal in allCalendars
+          if name of cal is "Calendar" then
+            set theCalendar to cal
             exit repeat
           end if
-        end if
+        end repeat
+      end try
+
+      set allEvents to calendar events of theCalendar
+      set i to 0
+      set searchString to "${searchTerm.replace(/"/g, '\\"')}"
+
+      repeat with theEvent in allEvents
+        try
+          set eventSubject to subject of theEvent
+          set eventLocation to location of theEvent
+
+          if (eventSubject contains searchString) or (eventLocation contains searchString) then
+            set i to i + 1
+            set eventData to {subject:eventSubject, ¬
+                         startTime:start time of theEvent, ¬
+                         endTime:end time of theEvent, ¬
+                         location:eventLocation, ¬
+                         eventId:id of theEvent}
+
+            set end of searchResults to eventData
+
+            -- Stop if we've reached the limit
+            if i >= ${limit} then
+              exit repeat
+            end if
+          end if
+        on error
+          -- Skip events that can't be accessed
+        end try
       end repeat
-      
+
       return searchResults
     end tell
   `;
-  
+
   try {
     const result = await runAppleScript(script);
     console.error(`[searchEvents] Raw result length: ${result.length}`);
-    
-    // Parse the results
-    const events = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
+
+    // Parse the results - format is comma-separated
+    const events: Array<{subject: string, start: string, end: string, location: string, id: string}> = [];
+
+    if (result && result.includes('subject:')) {
+      // Split by eventId to separate individual events
+      const eventStrings = result.split(/(?<=eventId:\d+),\s*(?=subject:)/);
+
+      if (eventStrings.length === 1 && result.includes('eventId:')) {
+        eventStrings[0] = result;
+      }
+
+      for (const eventStr of eventStrings) {
+        if (!eventStr.trim()) continue;
+
         try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const event: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              event[key] = value;
-            }
-          });
-          
-          if (event.subject) {
+          // Parse each field - times can contain commas
+          const subjectMatch = eventStr.match(/subject:([^]*?)(?=,\s*startTime:)/);
+          const startMatch = eventStr.match(/startTime:([^]*?)(?=,\s*endTime:)/);
+          const endMatch = eventStr.match(/endTime:([^]*?)(?=,\s*location:)/);
+          const locationMatch = eventStr.match(/location:([^]*?)(?=,\s*eventId:)/);
+          const idMatch = eventStr.match(/eventId:(\d+)/);
+
+          if (subjectMatch) {
             events.push({
-              subject: event.subject,
-              start: event.start,
-              end: event.end,
-              location: event.location || "No location",
-              id: event.id
+              subject: subjectMatch[1].trim(),
+              start: startMatch ? startMatch[1].trim() : "",
+              end: endMatch ? endMatch[1].trim() : "",
+              location: locationMatch ? locationMatch[1].trim() : "No location",
+              id: idMatch ? idMatch[1].trim() : ""
             });
           }
         } catch (parseError) {
-          console.error('[searchEvents] Error parsing event match:', parseError);
+          console.error('[searchEvents] Error parsing event:', parseError);
         }
       }
     }
@@ -1092,52 +1326,75 @@ async function searchEvents(searchTerm: string, limit: number = 10): Promise<any
 async function createEvent(subject: string, start: string, end: string, location?: string, body?: string, attendees?: string): Promise<string> {
   console.error(`[createEvent] Creating event: "${subject}", start: ${start}, end: ${end}`);
   await checkOutlookAccess();
-  
+
   // Parse the ISO date strings to a format AppleScript can understand
   const startDate = new Date(start);
   const endDate = new Date(end);
-  
-  // Format for AppleScript (month/day/year hour:minute:second)
-  const formattedStart = `date "${startDate.getMonth() + 1}/${startDate.getDate()}/${startDate.getFullYear()} ${startDate.getHours()}:${startDate.getMinutes()}:${startDate.getSeconds()}"`;
-  const formattedEnd = `date "${endDate.getMonth() + 1}/${endDate.getDate()}/${endDate.getFullYear()} ${endDate.getHours()}:${endDate.getMinutes()}:${endDate.getSeconds()}"`;
-  
+
+  // Use simpler date format that works with the minimal script
+  // Format: "Friday, September 26, 2025 at 10:00:00"
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+  const formatTime = (date: Date) => {
+    const day = days[date.getDay()];
+    const month = months[date.getMonth()];
+    const dayNum = date.getDate();
+    const year = date.getFullYear();
+    let hours = date.getHours();
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    const seconds = date.getSeconds().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12 || 12; // Convert to 12-hour format, 0 becomes 12
+    return `${day}, ${month} ${dayNum}, ${year} at ${hours}:${minutes}:${seconds} ${ampm}`;
+  };
+
+  const formattedStart = formatTime(startDate);
+  const formattedEnd = formatTime(endDate);
+
   // Escape strings for AppleScript
   const escapedSubject = subject.replace(/"/g, '\\"');
   const escapedLocation = location ? location.replace(/"/g, '\\"') : "";
   const escapedBody = body ? body.replace(/"/g, '\\"') : "";
-  
+
+  // Use simplified script that works
   let script = `
     tell application "Microsoft Outlook"
-      set theCalendar to default calendar
-      set newEvent to make new calendar event at theCalendar with properties {subject:"${escapedSubject}", start time:${formattedStart}, end time:${formattedEnd}
-  `;
-  
+      set newEvent to make new calendar event with properties {subject:"${escapedSubject}", start time:date "${formattedStart}", end time:date "${formattedEnd}"`;
+
+  // Add optional properties
   if (location) {
     script += `, location:"${escapedLocation}"`;
   }
-  
   if (body) {
     script += `, content:"${escapedBody}"`;
   }
-  
-  script += `}
-  `;
-  
+  script += '}';
+
   // Add attendees if provided
   if (attendees) {
     const attendeeList = attendees.split(',').map(email => email.trim());
-    
+
     for (const attendee of attendeeList) {
       const escapedAttendee = attendee.replace(/"/g, '\\"');
       script += `
-        make new attendee at newEvent with properties {email address:"${escapedAttendee}"}
-      `;
+
+      try
+        make new attendee at newEvent with properties {email address:{address:"${escapedAttendee}"}}
+      on error
+        -- Sometimes simplified format works better
+        try
+          make new attendee at newEvent with properties {email address:"${escapedAttendee}"}
+        on error
+          -- Skip if attendee can't be added
+        end try
+      end try`;
     }
   }
-  
+
   script += `
-      save newEvent
-      return "Event created successfully"
+
+      return id of newEvent as string
     end tell
   `;
   
@@ -1147,6 +1404,126 @@ async function createEvent(subject: string, start: string, end: string, location
     return result;
   } catch (error) {
     console.error("[createEvent] Error creating event:", error);
+    throw error;
+  }
+}
+
+// Function to delete a calendar event by ID
+async function deleteEvent(eventId: string): Promise<string> {
+  console.error(`[deleteEvent] Deleting event with ID: ${eventId}`);
+  await checkOutlookAccess();
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theEvent to calendar event id ${eventId}
+        delete theEvent
+        return "Event deleted successfully"
+      on error errMsg
+        return "Error deleting event: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[deleteEvent] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[deleteEvent] Error deleting event:", error);
+    throw error;
+  }
+}
+
+// Function to update a calendar event
+async function updateEvent(
+  eventId: string,
+  subject?: string,
+  start?: string,
+  end?: string,
+  location?: string,
+  body?: string
+): Promise<string> {
+  console.error(`[updateEvent] Updating event with ID: ${eventId}`);
+  await checkOutlookAccess();
+
+  let updateProps: string[] = [];
+
+  if (subject) {
+    const escapedSubject = subject.replace(/"/g, '\\"');
+    updateProps.push(`set subject of theEvent to "${escapedSubject}"`);
+  }
+
+  if (start) {
+    const startDate = new Date(start);
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    const formatTime = (date: Date) => {
+      const day = days[date.getDay()];
+      const month = months[date.getMonth()];
+      const dayNum = date.getDate();
+      const year = date.getFullYear();
+      let hours = date.getHours();
+      const minutes = date.getMinutes().toString().padStart(2, '0');
+      const seconds = date.getSeconds().toString().padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12; // Convert to 12-hour format
+      return `${day}, ${month} ${dayNum}, ${year} at ${hours}:${minutes}:${seconds} ${ampm}`;
+    };
+    updateProps.push(`set start time of theEvent to date "${formatTime(startDate)}"`);
+  }
+
+  if (end) {
+    const endDate = new Date(end);
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    const formatTime = (date: Date) => {
+      const day = days[date.getDay()];
+      const month = months[date.getMonth()];
+      const dayNum = date.getDate();
+      const year = date.getFullYear();
+      let hours = date.getHours();
+      const minutes = date.getMinutes().toString().padStart(2, '0');
+      const seconds = date.getSeconds().toString().padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12; // Convert to 12-hour format
+      return `${day}, ${month} ${dayNum}, ${year} at ${hours}:${minutes}:${seconds} ${ampm}`;
+    };
+    updateProps.push(`set end time of theEvent to date "${formatTime(endDate)}"`);
+  }
+
+  if (location) {
+    const escapedLocation = location.replace(/"/g, '\\"');
+    updateProps.push(`set location of theEvent to "${escapedLocation}"`);
+  }
+
+  if (body) {
+    const escapedBody = body.replace(/"/g, '\\"');
+    updateProps.push(`set content of theEvent to "${escapedBody}"`);
+  }
+
+  if (updateProps.length === 0) {
+    return "No updates specified";
+  }
+
+  const script = `
+    tell application "Microsoft Outlook"
+      try
+        set theEvent to calendar event id ${eventId}
+        ${updateProps.join('\n        ')}
+        return "Event updated successfully"
+      on error errMsg
+        return "Error updating event: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const result = await runAppleScript(script);
+    console.error(`[updateEvent] Result: ${result}`);
+    return result;
+  } catch (error) {
+    console.error("[updateEvent] Error updating event:", error);
     throw error;
   }
 }
@@ -1174,36 +1551,43 @@ async function listContacts(limit: number = 20): Promise<any[]> {
         repeat with i from 1 to limitCount
           try
             set theContact to item i of allContactsList
-            set contactName to full name of theContact
-            
-            -- Create a basic object with name
-            set contactData to {name:contactName}
-            
-            -- Try to get email 
+
+            -- Get contact name
+            set contactName to "Unknown"
+            try
+              set contactName to display name of theContact
+            on error
+              try
+                set contactName to first name of theContact & " " & last name of theContact
+              on error
+                -- Keep Unknown
+              end try
+            end try
+
+            -- Get email address
+            set contactEmail to "No email"
             try
               set emailList to email addresses of theContact
               if (count of emailList) > 0 then
-                set emailAddr to address of item 1 of emailList
-                set contactData to contactData & {email:emailAddr}
-              else
-                set contactData to contactData & {email:"No email"}
+                set contactEmail to address of item 1 of emailList
               end if
             on error
-              set contactData to contactData & {email:"No email"}
+              -- Keep No email
             end try
-            
-            -- Try to get phone
+
+            -- Get phone number
+            set contactPhone to "No phone"
             try
-              set phoneList to phones of theContact
+              set phoneList to phone numbers of theContact
               if (count of phoneList) > 0 then
-                set phoneNum to formatted dial string of item 1 of phoneList
-                set contactData to contactData & {phone:phoneNum}
-              else
-                set contactData to contactData & {phone:"No phone"}
+                set contactPhone to content of item 1 of phoneList
               end if
             on error
-              set contactData to contactData & {phone:"No phone"}
+              -- Keep No phone
             end try
+
+            -- Create contact data record
+            set contactData to {name:contactName, email:contactEmail, phone:contactPhone}
             
             set end of contactList to contactData
           on error
@@ -1220,29 +1604,27 @@ async function listContacts(limit: number = 20): Promise<any[]> {
       console.error(`[listContacts] Raw result length: ${result.length}`);
       
       // Parse the results
-      const contacts = [];
-      const matches = result.match(/\{([^}]+)\}/g);
-      
-      if (matches && matches.length > 0) {
-        for (const match of matches) {
+      const contacts: Array<{name: string, email: string, phone: string}> = [];
+
+      // Parse comma-separated format like: name:X, email:Y, phone:Z
+      if (result && result.includes('name:')) {
+        // Split by phone field to separate contacts
+        const contactStrings = result.split(/(?<=phone:[^,]+),\s*(?=name:)/);
+
+        for (const contactStr of contactStrings) {
+          if (!contactStr.trim()) continue;
+
           try {
-            const props = match.substring(1, match.length - 1).split(',');
-            const contact: any = {};
-            
-            props.forEach(prop => {
-              const parts = prop.split(':');
-              if (parts.length >= 2) {
-                const key = parts[0].trim();
-                const value = parts.slice(1).join(':').trim();
-                contact[key] = value;
-              }
-            });
-            
-            if (contact.name) {
+            // Parse each field
+            const nameMatch = contactStr.match(/name:([^,]*?)(?=,\s*email:|$)/);
+            const emailMatch = contactStr.match(/email:([^,]*?)(?=,\s*phone:|$)/);
+            const phoneMatch = contactStr.match(/phone:([^,]*?)(?=,|$)/);
+
+            if (nameMatch) {
               contacts.push({
-                name: contact.name,
-                email: contact.email || "No email",
-                phone: contact.phone || "No phone"
+                name: nameMatch[1].trim(),
+                email: emailMatch ? emailMatch[1].trim() : "No email",
+                phone: phoneMatch ? phoneMatch[1].trim() : "No phone"
               });
             }
           } catch (parseError) {
@@ -1313,22 +1695,45 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
         
         repeat with theContact in allContacts
           try
-            set contactName to full name of theContact
-            
+            -- Get contact name
+            set contactName to "Unknown"
+            try
+              set contactName to display name of theContact
+            on error
+              try
+                set contactName to first name of theContact & " " & last name of theContact
+              on error
+                -- Keep Unknown
+              end try
+            end try
+
             if contactName contains searchString then
               set i to i + 1
-              
-              -- Create basic contact info
-              set contactData to {name:contactName}
-              
-              -- Try to get email 
+
+              -- Get email address
+              set contactEmail to "No email"
               try
                 set emailList to email addresses of theContact
                 if (count of emailList) > 0 then
-                  set emailAddr to address of item 1 of emailList
-                  set contactData to contactData & {email:emailAddr}
-                else
-                  set contactData to contactData & {email:"No email"}
+                  set contactEmail to address of item 1 of emailList
+                end if
+              on error
+                -- Keep No email
+              end try
+
+              -- Get phone number
+              set contactPhone to "No phone"
+              try
+                set phoneList to phone numbers of theContact
+                if (count of phoneList) > 0 then
+                  set contactPhone to content of item 1 of phoneList
+                end if
+              on error
+                -- Keep No phone
+              end try
+
+              -- Create contact data record
+              set contactData to {name:contactName, email:contactEmail, phone:contactPhone}
                 end if
               on error
                 set contactData to contactData & {email:"No email"}
@@ -1368,29 +1773,27 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
       console.error(`[searchContacts] Raw result length: ${result.length}`);
       
       // Parse the results
-      const contacts = [];
-      const matches = result.match(/\{([^}]+)\}/g);
-      
-      if (matches && matches.length > 0) {
-        for (const match of matches) {
+      const contacts: Array<{name: string, email: string, phone: string}> = [];
+
+      // Parse comma-separated format like: name:X, email:Y, phone:Z
+      if (result && result.includes('name:')) {
+        // Split by phone field to separate contacts
+        const contactStrings = result.split(/(?<=phone:[^,]+),\s*(?=name:)/);
+
+        for (const contactStr of contactStrings) {
+          if (!contactStr.trim()) continue;
+
           try {
-            const props = match.substring(1, match.length - 1).split(',');
-            const contact: any = {};
-            
-            props.forEach(prop => {
-              const parts = prop.split(':');
-              if (parts.length >= 2) {
-                const key = parts[0].trim();
-                const value = parts.slice(1).join(':').trim();
-                contact[key] = value;
-              }
-            });
-            
-            if (contact.name) {
+            // Parse each field
+            const nameMatch = contactStr.match(/name:([^,]*?)(?=,\s*email:|$)/);
+            const emailMatch = contactStr.match(/email:([^,]*?)(?=,\s*phone:|$)/);
+            const phoneMatch = contactStr.match(/phone:([^,]*?)(?=,|$)/);
+
+            if (nameMatch) {
               contacts.push({
-                name: contact.name,
-                email: contact.email || "No email",
-                phone: contact.phone || "No phone"
+                name: nameMatch[1].trim(),
+                email: emailMatch ? emailMatch[1].trim() : "No email",
+                phone: phoneMatch ? phoneMatch[1].trim() : "No phone"
               });
             }
           } catch (parseError) {
@@ -1485,7 +1888,7 @@ function isMailArgs(args: unknown): args is {
 }
 
 function isCalendarArgs(args: unknown): args is {
-  operation: "today" | "upcoming" | "search" | "create";
+  operation: "today" | "upcoming" | "search" | "create" | "delete" | "update";
   searchTerm?: string;
   limit?: number;
   days?: number;
@@ -1495,12 +1898,17 @@ function isCalendarArgs(args: unknown): args is {
   location?: string;
   body?: string;
   attendees?: string;
+  eventId?: string;
 } {
-  if (typeof args !== "object" || args === null) return false;
-  
+  if (typeof args !== "object" || args === null) {
+    console.error("[isCalendarArgs] args is not an object or is null");
+    return false;
+  }
+
   const { operation } = args as any;
+  console.error(`[isCalendarArgs] operation: ${operation}, args:`, JSON.stringify(args));
   
-  if (!operation || !["today", "upcoming", "search", "create"].includes(operation)) {
+  if (!operation || !["today", "upcoming", "search", "create", "delete", "update"].includes(operation)) {
     return false;
   }
   
@@ -1511,6 +1919,12 @@ function isCalendarArgs(args: unknown): args is {
       break;
     case "create":
       if (!(args as any).subject || !(args as any).start || !(args as any).end) return false;
+      break;
+    case "delete":
+      if (!(args as any).eventId) return false;
+      break;
+    case "update":
+      if (!(args as any).eventId) return false;
       break;
   }
   
@@ -1739,7 +2153,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               isError: false
             };
           }
-          
+
+          case "delete": {
+            if (!args.eventId) {
+              throw new Error("Event ID is required for delete operation");
+            }
+            const result = await deleteEvent(args.eventId);
+            return {
+              content: [{ type: "text", text: result }],
+              isError: false
+            };
+          }
+
+          case "update": {
+            if (!args.eventId) {
+              throw new Error("Event ID is required for update operation");
+            }
+            const result = await updateEvent(
+              args.eventId,
+              args.subject,
+              args.start,
+              args.end,
+              args.location,
+              args.body
+            );
+            return {
+              content: [{ type: "text", text: result }],
+              isError: false
+            };
+          }
+
           default:
             throw new Error(`Unknown calendar operation: ${operation}`);
         }
