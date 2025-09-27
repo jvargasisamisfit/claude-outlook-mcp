@@ -6,7 +6,42 @@ import {
   ListToolsRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { runAppleScript } from 'run-applescript';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
+
+// Helper function to execute AppleScript
+async function runAppleScript(script: string): Promise<string> {
+  try {
+    // Use a temp file for multi-line scripts to avoid escaping issues
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+
+    const tempFile = path.join(os.tmpdir(), `outlook-mcp-${Date.now()}.applescript`);
+    fs.writeFileSync(tempFile, script);
+
+    console.error(`[runAppleScript] Executing script from temp file: ${tempFile}`);
+    const { stdout, stderr } = await execAsync(`osascript ${tempFile}`);
+
+    // Clean up temp file
+    try {
+      fs.unlinkSync(tempFile);
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+
+    if (stderr) {
+      console.error("AppleScript stderr:", stderr);
+    }
+    console.error(`[runAppleScript] Raw stdout length: ${stdout.length}, first 200 chars: "${stdout.substring(0, 200)}"`);
+    return stdout.trim();
+  } catch (error: any) {
+    console.error("AppleScript error:", error);
+    throw new Error(`AppleScript execution failed: ${error.message}`);
+  }
+}
 
 // ====================================================
 // 1. Tool Definitions
@@ -238,37 +273,88 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
     tell application "Microsoft Outlook"
       try
         set theFolder to ${folderPath} -- Use the specified folder or default to inbox
-        set unreadMessages to {}
-        set allMessages to messages of theFolder
+
+        -- Get unread messages directly using whose clause (avoids corrupted message issues)
+        set unreadMessages to messages of theFolder whose is read is false
+        set totalUnread to count of unreadMessages
+
+        if totalUnread = 0 then
+          return "NO_UNREAD_EMAILS"
+        end if
+
+        set unreadList to {}
         set i to 0
-        
-        repeat with theMessage in allMessages
-          if read status of theMessage is false then
+
+        repeat with theMessage in unreadMessages
+          try
             set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
-                       date:time sent of theMessage, id:id of theMessage}
-            
+
+            -- Try to get each property individually with fallbacks
+            set msgSubject to "No subject"
+            try
+              set msgSubject to subject of theMessage
+            on error
+              -- Keep default
+            end try
+
+            set msgSender to "Unknown sender"
+            try
+              set msgSender to email address of sender of theMessage
+            on error
+              -- Keep default
+            end try
+
+            set msgDate to current date
+            try
+              set msgDate to time received of theMessage
+            on error
+              -- Keep default
+            end try
+
+            set msgId to "0"
+            try
+              set msgId to id of theMessage
+            on error
+              -- Keep default
+            end try
+
             -- Try to get content
+            set msgContent to "[Content not available]"
             try
               set msgContent to content of theMessage
+              -- Remove newlines and limit length
+              set AppleScript's text item delimiters to {return, linefeed, character id 8232, character id 8233}
+              set msgContent to text items of msgContent
+              set AppleScript's text item delimiters to " "
+              set msgContent to msgContent as string
+              set AppleScript's text item delimiters to ""
+
               if length of msgContent > 500 then
                 set msgContent to (text 1 thru 500 of msgContent) & "..."
               end if
-              set msgData to msgData & {content:msgContent}
             on error
-              set msgData to msgData & {content:"[Content not available]"}
+              -- Keep default
             end try
-            
-            set end of unreadMessages to msgData
-            
+
+            -- Format as delimited string on single line
+            set emailRecord to (msgId as string) & "|||" & msgSubject & "|||" & msgSender & "|||" & (msgDate as string) & "|||" & msgContent
+            set end of unreadList to emailRecord
+
             -- Stop if we've reached the limit
             if i >= ${limit} then
               exit repeat
             end if
-          end if
+          on error
+            -- Skip problematic messages
+          end try
         end repeat
-        
-        return unreadMessages
+
+        -- Join all records with newline separator
+        set AppleScript's text item delimiters to ASCII character 10
+        set outputText to unreadList as string
+        set AppleScript's text item delimiters to ""
+
+        return outputText
       on error errMsg
         return "Error: " & errMsg
       end try
@@ -278,44 +364,34 @@ async function getUnreadEmails(folder: string = "Inbox", limit: number = 10): Pr
   try {
     const result = await runAppleScript(script);
     console.error(`[getUnreadEmails] Raw result length: ${result.length}`);
-    
-    // Parse the results (AppleScript returns records as text)
+    console.error(`[getUnreadEmails] First 100 chars of result: "${result.substring(0, 100)}"`);
+    console.error(`[getUnreadEmails] Result equals NO_UNREAD_EMAILS: ${result === "NO_UNREAD_EMAILS"}`);
+    console.error(`[getUnreadEmails] Result trimmed is empty: ${result.trim() === ""}`);
+
+    // Parse the results
     if (result.startsWith("Error:")) {
       throw new Error(result);
     }
-    
-    // Simple parsing for demonstration
-    // In a production environment, you'd want more robust parsing
+
+    if (result === "NO_UNREAD_EMAILS" || result.trim() === "") {
+      console.error(`[getUnreadEmails] Returning empty array - result was: "${result}"`);
+      return [];
+    }
+
+    // Parse the delimiter-based format - AppleScript returns actual newlines
     const emails = [];
-    const matches = result.match(/\{([^}]+)\}/g);
-    
-    if (matches && matches.length > 0) {
-      for (const match of matches) {
-        try {
-          const props = match.substring(1, match.length - 1).split(',');
-          const email: any = {};
-          
-          props.forEach(prop => {
-            const parts = prop.split(':');
-            if (parts.length >= 2) {
-              const key = parts[0].trim();
-              const value = parts.slice(1).join(':').trim();
-              email[key] = value;
-            }
-          });
-          
-          if (email.subject || email.sender) {
-            emails.push({
-              subject: email.subject || "No subject",
-              sender: email.sender || "Unknown sender",
-              dateSent: email.date || new Date().toString(),
-              content: email.content || "[Content not available]",
-              id: email.id || ""
-            });
-          }
-        } catch (parseError) {
-          console.error('[getUnreadEmails] Error parsing email match:', parseError);
-        }
+    const lines = result.split('\n').filter(line => line.trim());
+
+    for (const line of lines) {
+      const parts = line.split('|||');
+      if (parts.length >= 5) {
+        emails.push({
+          id: parts[0].trim(),
+          subject: parts[1].trim(),
+          sender: parts[2].trim(),
+          dateSent: parts[3].trim(),
+          content: parts[4].trim()
+        });
       }
     }
     
@@ -355,29 +431,35 @@ async function searchEmails(searchTerm: string, folder: string = "Inbox", limit:
         set searchString to "${searchTerm.replace(/"/g, '\\"')}"
         
         repeat with theMessage in allMessages
-          if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
-            set i to i + 1
-            set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
-                       date:time sent of theMessage, id:id of theMessage}
-            
-            -- Try to get content
-            try
-              set msgContent to content of theMessage
-              if length of msgContent > 500 then
-                set msgContent to (text 1 thru 500 of msgContent) & "..."
+          try
+            -- Wrap individual message processing in try-catch
+            if (subject of theMessage contains searchString) or (content of theMessage contains searchString) then
+              set i to i + 1
+              set msgData to {subject:subject of theMessage, sender:sender of theMessage, ¬
+                         date:time sent of theMessage, id:id of theMessage}
+
+              -- Try to get content
+              try
+                set msgContent to content of theMessage
+                if length of msgContent > 500 then
+                  set msgContent to (text 1 thru 500 of msgContent) & "..."
+                end if
+                set msgData to msgData & {content:msgContent}
+              on error
+                set msgData to msgData & {content:"[Content not available]"}
+              end try
+
+              set end of searchResults to msgData
+
+              -- Stop if we've reached the limit
+              if i >= ${limit} then
+                exit repeat
               end if
-              set msgData to msgData & {content:msgContent}
-            on error
-              set msgData to msgData & {content:"[Content not available]"}
-            end try
-            
-            set end of searchResults to msgData
-            
-            -- Stop if we've reached the limit
-            if i >= ${limit} then
-              exit repeat
             end if
-          end if
+          on error
+            -- Skip corrupted messages and continue
+            -- log "Skipped corrupted message during search"
+          end try
         end repeat
         
         return searchResults
@@ -812,20 +894,39 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
             try
               set theMsg to item i of allMsgs
 
+              -- Try to access the message properties
+              set msgSubject to "Unknown"
+              try
+                set msgSubject to subject of theMsg
+              on error
+                -- Keep default
+              end try
+
               -- Get sender information
-              set msgSender to sender of theMsg
               set senderName to "Unknown"
               set senderAddress to "unknown@example.com"
-
               try
-                set senderName to name of msgSender
-                set senderAddress to address of msgSender
-              on error
+                set msgSender to sender of theMsg
                 try
-                  set senderAddress to msgSender as string
+                  set senderName to name of msgSender
+                  set senderAddress to address of msgSender
                 on error
-                  -- Keep defaults
+                  try
+                    set senderAddress to msgSender as string
+                  on error
+                    -- Keep defaults
+                  end try
                 end try
+              on error
+                -- Keep defaults
+              end try
+
+              -- Get date
+              set msgDate to current date
+              try
+                set msgDate to time sent of theMsg
+              on error
+                -- Keep default
               end try
 
               -- Get message content (limited to first 500 chars)
@@ -839,18 +940,27 @@ async function readEmails(folder: string = "Inbox", limit: number = 10): Promise
                 set msgContent to "[Content not available]"
               end try
 
+              -- Get message ID
+              set msgIdValue to "0"
+              try
+                set msgIdValue to id of theMsg
+              on error
+                -- Keep default
+              end try
+
               -- Create structured record
-              set msgData to {subject:subject of theMsg, ¬
+              set msgData to {subject:msgSubject, ¬
                          senderName:senderName, ¬
                          senderAddress:senderAddress, ¬
-                         dateReceived:time sent of theMsg, ¬
+                         dateReceived:msgDate, ¬
                          msgContent:msgContent, ¬
-                         msgId:id of theMsg}
+                         msgId:msgIdValue}
 
               set end of messageList to msgData
               set msgCount to msgCount + 1
             on error
-              -- Skip problematic messages
+              -- Skip corrupted messages entirely
+              -- log "Skipped corrupted message in readEmails"
             end try
           end repeat
 
@@ -1540,7 +1650,8 @@ async function listContacts(limit: number = 20): Promise<any[]> {
     const script = `
       tell application "Microsoft Outlook"
         set contactList to {}
-        set allContactsList to contacts
+        set addressBook to address book "Address Book"
+        set allContactsList to every contact of addressBook
         set contactCount to count of allContactsList
         set limitCount to ${limit}
         
@@ -1586,9 +1697,9 @@ async function listContacts(limit: number = 20): Promise<any[]> {
               -- Keep No phone
             end try
 
-            -- Create contact data record
-            set contactData to {name:contactName, email:contactEmail, phone:contactPhone}
-            
+            -- Create contact data as string
+            set contactData to "name:" & contactName & ", email:" & contactEmail & ", phone:" & contactPhone
+
             set end of contactList to contactData
           on error
             -- Skip contacts that can't be processed
@@ -1606,19 +1717,19 @@ async function listContacts(limit: number = 20): Promise<any[]> {
       // Parse the results
       const contacts: Array<{name: string, email: string, phone: string}> = [];
 
-      // Parse comma-separated format like: name:X, email:Y, phone:Z
-      if (result && result.includes('name:')) {
-        // Split by phone field to separate contacts
-        const contactStrings = result.split(/(?<=phone:[^,]+),\s*(?=name:)/);
+      // Parse the AppleScript list format
+      if (result) {
+        // AppleScript returns list items separated by newlines
+        const contactStrings = result.split('\n').filter(line => line.trim());
 
         for (const contactStr of contactStrings) {
-          if (!contactStr.trim()) continue;
+          if (!contactStr.trim() || !contactStr.includes('name:')) continue;
 
           try {
-            // Parse each field
-            const nameMatch = contactStr.match(/name:([^,]*?)(?=,\s*email:|$)/);
-            const emailMatch = contactStr.match(/email:([^,]*?)(?=,\s*phone:|$)/);
-            const phoneMatch = contactStr.match(/phone:([^,]*?)(?=,|$)/);
+            // Parse each field - format is "name:X, email:Y, phone:Z"
+            const nameMatch = contactStr.match(/name:([^,]*?)(?:,|$)/);
+            const emailMatch = contactStr.match(/email:([^,]*?)(?:,|$)/);
+            const phoneMatch = contactStr.match(/phone:([^,]*?)(?:,|$)/);
 
             if (nameMatch) {
               contacts.push({
@@ -1628,7 +1739,7 @@ async function listContacts(limit: number = 20): Promise<any[]> {
               });
             }
           } catch (parseError) {
-            console.error('[listContacts] Error parsing contact match:', parseError);
+            console.error('[listContacts] Error parsing contact:', contactStr, parseError);
           }
         }
       }
@@ -1643,21 +1754,23 @@ async function listContacts(limit: number = 20): Promise<any[]> {
         const alternativeScript = `
           tell application "Microsoft Outlook"
             set contactList to {}
-            set contactCount to count of contacts
+            set addressBook to address book "Address Book"
+            set allContacts to every contact of addressBook
+            set contactCount to count of allContacts
             set limitCount to ${limit}
-            
+
             if contactCount < limitCount then
               set limitCount to contactCount
             end if
-            
+
             repeat with i from 1 to limitCount
               try
-                set theContact to item i of contacts
-                set contactName to full name of theContact
+                set theContact to item i of allContacts
+                set contactName to display name of theContact
                 set end of contactList to contactName
               end try
             end repeat
-            
+
             return contactList
           end tell
         `;
@@ -1665,8 +1778,8 @@ async function listContacts(limit: number = 20): Promise<any[]> {
         const result = await runAppleScript(alternativeScript);
         
         // Parse the simpler result format (just names)
-        const simplifiedContacts = result.split(", ").map(name => ({
-          name: name,
+        const simplifiedContacts = result.split(", ").filter(name => name.trim()).map(name => ({
+          name: name.trim(),
           email: "Not available with simplified method",
           phone: "Not available with simplified method"
         }));
@@ -1689,10 +1802,11 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
     const script = `
       tell application "Microsoft Outlook"
         set searchResults to {}
-        set allContacts to contacts
+        set addressBook to address book "Address Book"
+        set allContacts to every contact of addressBook
         set i to 0
         set searchString to "${searchTerm.replace(/"/g, '\\"')}"
-        
+
         repeat with theContact in allContacts
           try
             -- Get contact name
@@ -1732,26 +1846,9 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
                 -- Keep No phone
               end try
 
-              -- Create contact data record
-              set contactData to {name:contactName, email:contactEmail, phone:contactPhone}
-                end if
-              on error
-                set contactData to contactData & {email:"No email"}
-              end try
-              
-              -- Try to get phone
-              try
-                set phoneList to phones of theContact
-                if (count of phoneList) > 0 then
-                  set phoneNum to formatted dial string of item 1 of phoneList
-                  set contactData to contactData & {phone:phoneNum}
-                else
-                  set contactData to contactData & {phone:"No phone"}
-                end if
-              on error
-                set contactData to contactData & {phone:"No phone"}
-              end try
-              
+              -- Create contact data as string
+              set contactData to "name:" & contactName & ", email:" & contactEmail & ", phone:" & contactPhone
+
               set end of searchResults to contactData
               
               -- Stop if we've reached the limit
@@ -1775,19 +1872,19 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
       // Parse the results
       const contacts: Array<{name: string, email: string, phone: string}> = [];
 
-      // Parse comma-separated format like: name:X, email:Y, phone:Z
-      if (result && result.includes('name:')) {
-        // Split by phone field to separate contacts
-        const contactStrings = result.split(/(?<=phone:[^,]+),\s*(?=name:)/);
+      // Parse the AppleScript list format
+      if (result) {
+        // AppleScript returns list items separated by newlines
+        const contactStrings = result.split('\n').filter(line => line.trim());
 
         for (const contactStr of contactStrings) {
-          if (!contactStr.trim()) continue;
+          if (!contactStr.trim() || !contactStr.includes('name:')) continue;
 
           try {
-            // Parse each field
-            const nameMatch = contactStr.match(/name:([^,]*?)(?=,\s*email:|$)/);
-            const emailMatch = contactStr.match(/email:([^,]*?)(?=,\s*phone:|$)/);
-            const phoneMatch = contactStr.match(/phone:([^,]*?)(?=,|$)/);
+            // Parse each field - format is "name:X, email:Y, phone:Z"
+            const nameMatch = contactStr.match(/name:([^,]*?)(?:,|$)/);
+            const emailMatch = contactStr.match(/email:([^,]*?)(?:,|$)/);
+            const phoneMatch = contactStr.match(/phone:([^,]*?)(?:,|$)/);
 
             if (nameMatch) {
               contacts.push({
@@ -1797,7 +1894,7 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
               });
             }
           } catch (parseError) {
-            console.error('[searchContacts] Error parsing contact match:', parseError);
+            console.error('[searchContacts] Error parsing contact:', contactStr, parseError);
           }
         }
       }
@@ -1833,8 +1930,8 @@ async function searchContacts(searchTerm: string, limit: number = 10): Promise<a
         const result = await runAppleScript(alternativeScript);
         
         // Parse the simpler result format (just names)
-        const simplifiedContacts = result.split(", ").map(name => ({
-          name: name,
+        const simplifiedContacts = result.split(", ").filter(name => name.trim()).map(name => ({
+          name: name.trim(),
           email: "Not available with simplified method",
           phone: "Not available with simplified method"
         }));
